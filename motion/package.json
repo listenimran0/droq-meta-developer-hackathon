@@ -1,0 +1,23 @@
+{
+  "name": "droq-motion",
+  "version": "1.0.0",
+  "description": "Remotion motion piece for the DROQ Drop journey",
+  "main": "index.js",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render src/index.ts DroqJourney out/droq-journey.mp4 --codec=h264 --crf=18",
+    "still": "remotion still src/index.ts DroqJourney out/frame.png --frame=430",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@remotion/cli": "^4.0.537",
+    "@remotion/fonts": "^4.0.537",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "remotion": "^4.0.537"
+  },
+  "private": true
+}

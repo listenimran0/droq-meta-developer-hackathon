@@ -1,0 +1,183 @@
+{
+  "expo": {
+    "name": "DROQ",
+    "slug": "droq",
+    "version": "1.2.3",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "droq",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#050609"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.droq.app",
+      "buildNumber": "6",
+      "icon": "./assets/icon.png",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "DROQ needs your location to discover nearby Drops in the physical world.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "DROQ uses your location to notify you when something is waiting nearby.",
+        "NSCameraUsageDescription": "DROQ needs camera access to leave photo memories.",
+        "NSMicrophoneUsageDescription": "DROQ needs microphone access to leave voice Drops.",
+        "NSPhotoLibraryUsageDescription": "DROQ needs photo library access to leave photo memories."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#050609",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "package": "com.droq.app",
+      "versionCode": 8,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "CAMERA",
+        "POST_NOTIFICATIONS"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": false,
+          "data": [
+            {
+              "scheme": "droq",
+              "host": "auth",
+              "pathPrefix": "/"
+            },
+            {
+              "scheme": "droq",
+              "host": "hunt",
+              "pathPrefix": "/"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        },
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "droq.app",
+              "pathPrefix": "/hunt"
+            },
+            {
+              "scheme": "https",
+              "host": "droq.app",
+              "pathPrefix": "/q"
+            },
+            {
+              "scheme": "https",
+              "host": "droq.app",
+              "pathPrefix": "/qr"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ],
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-audio",
+      "expo-video",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#050609",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 220,
+          "resizeMode": "contain",
+          "dark": {
+            "backgroundColor": "#050609",
+            "image": "./assets/splash-icon.png"
+          }
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#F2E4BE",
+          "icon": "./assets/android-icon-monochrome.png"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow DROQ to use your location to discover nearby Drops.",
+          "locationAlwaysAndWhenInUsePermission": "Allow DROQ to notify you when something is waiting nearby, even in the background.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow DROQ to access your photos for Drop memories.",
+          "cameraPermission": "Allow DROQ to use your camera for Drop memories."
+        }
+      ],
+      "expo-font",
+      [
+        "react-native-google-mobile-ads",
+        {
+          "androidAppId": "ca-app-pub-5822607086908086~7579854490",
+          "iosAppId": "ca-app-pub-3940256099942544~1458002511"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "enableMinifyInReleaseBuilds": true,
+            "enableShrinkResourcesInReleaseBuilds": true,
+            "enablePngCrunchInReleaseBuilds": true,
+            "buildArchs": [
+              "armeabi-v7a",
+              "arm64-v8a"
+            ],
+            "extraProguardRules": "-keepattributes SourceFile,LineNumberTable\n-keepattributes *Annotation*\n-keep class com.facebook.react.** { *; }\n-keep class com.facebook.hermes.** { *; }\n-keep class com.facebook.jni.** { *; }\n-keep class com.swmansion.reanimated.** { *; }\n-keep class com.swmansion.worklets.** { *; }\n-keep class com.google.android.gms.ads.** { *; }\n-keep class com.google.ads.** { *; }\n-dontwarn com.google.android.gms.**\n-dontwarn com.facebook.react.**"
+          }
+        }
+      ],
+      "expo-sharing"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "6dcfff04-2ba8-4d36-8a89-5f04368b404f"
+      }
+    }
+  },
+  "react-native-google-mobile-ads": {
+    "android_app_id": "ca-app-pub-5822607086908086~7579854490",
+    "ios_app_id": "ca-app-pub-3940256099942544~1458002511"
+  }
+}

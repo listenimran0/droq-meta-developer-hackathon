@@ -1,0 +1,47 @@
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_DEV_SIMULATION": "true"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://ughruhvqqarlerxwzjoz.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVnaHJ1aHZxcWFybGVyeHd6am96Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1NzE3NjQsImV4cCI6MjEwNDE0Nzc2NH0.WCEYzbzqJ_Cw-mDXOEy805desl7raQXnIppiD7l9xwA",
+        "EXPO_PUBLIC_DEV_SIMULATION": "false",
+        "EXPO_PUBLIC_TEST_LOCATION_LAT": "23.7806",
+        "EXPO_PUBLIC_TEST_LOCATION_LNG": "90.4070"
+      }
+    },
+    "production": {
+      "autoIncrement": false,
+      "android": {
+        "buildType": "app-bundle",
+        "buildArtifactPaths": [
+          "android/app/build/outputs/mapping/release/mapping.txt"
+        ]
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://ughruhvqqarlerxwzjoz.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVnaHJ1aHZxcWFybGVyeHd6am96Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1NzE3NjQsImV4cCI6MjEwNDE0Nzc2NH0.WCEYzbzqJ_Cw-mDXOEy805desl7raQXnIppiD7l9xwA",
+        "EXPO_PUBLIC_DEV_SIMULATION": "false",
+        "EXPO_PUBLIC_TEST_LOCATION_LAT": "23.7806",
+        "EXPO_PUBLIC_TEST_LOCATION_LNG": "90.4070"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

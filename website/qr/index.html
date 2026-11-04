@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DROQ — something is waiting here</title>
+  <meta name="description" content="A Drop is waiting at this place. Open DROQ and walk until it unlocks — no map pin." />
+  <meta property="og:title" content="DROQ — A place holds a secret" />
+  <meta property="og:description" content="Scan. Walk. Unlock. Distance is the only clue." />
+  <meta property="og:image" content="https://droq.app/assets/feature-graphic.png" />
+  <meta name="theme-color" content="#07080B" />
+  <link rel="icon" href="/assets/favicon.png" type="image/png" />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Syne:wght@600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/site.css" />
+  <style>
+    .hunt-wrap { max-width: 28rem; margin: 0 auto; padding: 4rem 1.25rem 6rem; text-align: left; }
+    .hunt-brand { font-family: Syne, sans-serif; font-size: 2rem; letter-spacing: 0.35em; color: #F4F1EA; margin: 0 0 2rem; }
+    .hunt-kicker { font-size: 0.7rem; letter-spacing: 0.2em; text-transform: uppercase; color: #F2E4BE; margin: 0 0 0.75rem; }
+    .hunt-title { font-family: "DM Sans", sans-serif; font-size: 1.35rem; line-height: 1.55; color: rgba(244,241,234,0.72); margin: 0 0 1.75rem; font-weight: 400; }
+    .hunt-actions { display: flex; flex-direction: column; gap: 0.75rem; }
+    .hunt-actions a {
+      display: inline-block; text-align: center; text-decoration: none;
+      padding: 0.9rem 1.1rem; border-radius: 0.5rem; font-family: "DM Sans", sans-serif; font-weight: 500;
+    }
+    .hunt-primary { background: #F2E4BE; color: #05060A; }
+    .hunt-secondary { border: 1px solid rgba(242,228,190,0.45); color: #FFEEC4; }
+    .hunt-meta { margin-top: 1.5rem; font-size: 0.85rem; color: rgba(244,241,234,0.34); line-height: 1.5; }
+    body { background: #07080B; color: #F4F1EA; min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <main class="hunt-wrap">
+    <p class="hunt-brand">DROQ</p>
+    <p class="hunt-kicker" id="kicker">Partner place</p>
+    <h1 class="hunt-title">Something was left at this place. Open DROQ — walk until the ring settles. No pin on a map.</h1>
+    <div class="hunt-actions">
+      <a class="hunt-primary" id="open-app" href="#">Open in DROQ</a>
+      <a class="hunt-secondary" href="https://play.google.com/store/apps/details?id=com.droq.app">Get the app</a>
+    </div>
+    <p class="hunt-meta">Partner QR codes never include GPS. The Drop only opens when you’re physically close.</p>
+  </main>
+  <script>
+    (function () {
+      var parts = location.pathname.split('/').filter(Boolean);
+      var kind = parts[0] || 'q';
+      var id = parts[parts.length - 1];
+      if (!id || id === 'q' || id === 'hunt' || id === 'qr') {
+        id = new URLSearchParams(location.search).get('id') || '';
+      }
+      var uuid = /^[0-9a-f-]{36}$/i.test(id) ? id : '';
+      var deep = uuid ? 'droq://hunt/' + uuid : 'droq://';
+      var kicker = document.getElementById('kicker');
+      if (kicker && kind === 'hunt') kicker.textContent = 'Hunt invite';
+      var el = document.getElementById('open-app');
+      if (el) {
+        el.setAttribute('href', deep);
+        // Don’t auto-redirect on desktop; only nudge on coarse touch devices
+        var touch = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
+        if (uuid && touch) {
+          setTimeout(function () { window.location.href = deep; }, 400);
+        }
+      }
+    })();
+  </script>
+</body>
+</html>
