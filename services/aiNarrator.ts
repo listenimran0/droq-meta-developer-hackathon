@@ -1,3 +1,4 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { acceptBestTime, localBrief, sanitizeBrief, toAggregates, type BusinessBrief, type BusinessInsights } from '@/services/insights';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import { trackEvent } from './analytics';
@@ -57,6 +58,12 @@ export function getLastNarratorError(): string | null {
   return lastServerError;
 }
 
+/** True when the last call was served degraded (Meta outage/429 or breaker open). */
+let lastDegraded = false;
+export function wasLastNarratorDegraded(): boolean {
+  return lastDegraded;
+}
+
 async function invokeFn(
   body: Record<string, unknown>,
   timeoutMs: number = INVOKE_TIMEOUT_MS,
@@ -72,6 +79,7 @@ async function invokeFn(
   image?: unknown;
   brief?: unknown;
   engine?: unknown;
+  degraded?: unknown;
 } | null> {
   try {
     const res = await Promise.race([
@@ -92,6 +100,7 @@ async function invokeFn(
       return null;
     }
     lastServerError = (data as { fallback?: unknown }).fallback ? (code ?? 'fallback') : null;
+    lastDegraded = (data as { degraded?: unknown }).degraded === true;
     return data as {
       ok: boolean;
       fallback: boolean;
@@ -104,6 +113,7 @@ async function invokeFn(
       image?: unknown;
       brief?: unknown;
       engine?: unknown;
+      degraded?: unknown;
     };
   } catch {
     return null;
@@ -375,8 +385,14 @@ export function __clearNarratorCache(): void {
  * Muse Business Brief: aggregates in, {summary, tips[3]} out. Falls back to a
  * deterministic template; `ai` tells the UI whether the model wrote it.
  */
-const briefCache = new Map<string, { at: number; value: { brief: BusinessBrief; ai: boolean } }>();
-const BRIEF_TTL_MS = 30 * 60_000;
+const briefCache = new Map<string, { brief: BusinessBrief; ai: boolean }>();
+const BRIEF_STORE = 'droq:brief:';
+
+function hashStr(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
 
 export async function fetchBusinessBrief(
   insights: BusinessInsights,
@@ -384,16 +400,37 @@ export async function fetchBusinessBrief(
 ): Promise<{ brief: BusinessBrief; ai: boolean }> {
   const fallbackBrief = { brief: localBrief(insights, locale), ai: false };
   if (!isSupabaseConfigured) return fallbackBrief;
-  // Same numbers + language → same brief: don't spend the hourly AI budget on every screen open.
-  const key = `${locale}:${JSON.stringify(toAggregates(insights))}`;
-  const hit = briefCache.get(key);
-  if (hit && Date.now() - hit.at < BRIEF_TTL_MS) return hit.value;
-  const data = await invokeFn({ action: 'business_brief', locale, aggregates: toAggregates(insights) }, 30_000);
+  // One brief per owner, per day, per language and data snapshot: repeat views are instant and free.
+  let owner = 'anon';
+  try {
+    const { data } = await supabase.auth.getSession();
+    owner = data.session?.user.id ?? 'anon';
+  } catch {
+    /* keep anon */
+  }
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `${BRIEF_STORE}${owner}:${day}:${locale}:${hashStr(JSON.stringify(toAggregates(insights)))}`;
+  const mem = briefCache.get(key);
+  if (mem) return mem;
+  try {
+    const stored = await AsyncStorage.getItem(key);
+    if (stored) {
+      const v = JSON.parse(stored) as { brief: BusinessBrief; ai: boolean };
+      if (v?.brief?.summary) {
+        briefCache.set(key, v);
+        return v;
+      }
+    }
+  } catch {
+    /* cache is best-effort */
+  }
+  const data = await invokeFn({ action: 'business_brief', locale, aggregates: toAggregates(insights) }, 45_000);
   if (!data || data.fallback) return fallbackBrief;
   const brief = sanitizeBrief(data.brief);
   if (!brief) return fallbackBrief;
   brief.bestTime = acceptBestTime(brief.bestTime, insights.audience, locale);
   const value = { brief, ai: true };
-  briefCache.set(key, { at: Date.now(), value });
+  briefCache.set(key, value);
+  AsyncStorage.setItem(key, JSON.stringify(value)).catch(() => undefined);
   return value;
 }

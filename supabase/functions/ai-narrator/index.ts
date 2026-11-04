@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { countsAsFailure as _cf, guardedCall, isDegraded, modelErrorCode, modelFetch, type FetchOpts } from "./resilience.ts";
 
 /**
  * ai-narrator — Muse-powered copy for Sense + Ghost Writer.
@@ -18,7 +19,7 @@ import { createClient } from "npm:@supabase/supabase-js@2";
  * use its local templates — the demo survives dead networks and bad keys.
  */
 
-const FN_VERSION = 8;
+const FN_VERSION = 11;
 
 type Action =
   | "sense_reason"
@@ -56,6 +57,8 @@ type NarrateRequest = {
   /** clue_options: Business switch is on → write an offer teaser, not a clue */
   business?: boolean;
   business_name?: string;
+  /** load-test only: honoured solely for @loadtest.invalid users and routed to an isolated breaker */
+  _sim?: "fail" | "ok";
 };
 
 type NarrateResponse = {
@@ -80,13 +83,22 @@ type NarrateResponse = {
   image?: { b64?: string; url?: string };
   /** business_brief: sanitized summary + exactly 3 tips */
   brief?: { summary: string; tips: string[]; best_time?: string };
+  /** model unavailable (circuit open / timeouts) — a non-AI fallback was served */
+  degraded?: boolean;
+  cache?: "hit" | "miss" | "wait";
+  tokens?: number;
 };
 
 function json(body: NarrateResponse, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-ai-fb": body.fallback ? "1" : "0",
+  };
+  if (body.error) headers["x-ai-err"] = body.error;
+  if (body.degraded) headers["x-ai-deg"] = "1";
+  if (body.cache) headers["x-ai-cache"] = body.cache;
+  if (body.tokens) headers["x-ai-tok"] = String(body.tokens);
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
 const base = (extra: Partial<NarrateResponse>): NarrateResponse => ({
@@ -119,6 +131,85 @@ function throttled(userId: string, limit = 20, windowMs = 60_000): boolean {
   arr.push(now);
   hits.set(userId, arr);
   return arr.length > limit;
+}
+
+type Admin = ReturnType<typeof createClient>;
+type Tally = { tokens: number };
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function sha(input: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return [...new Uint8Array(buf)].slice(0, 12).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function rpcQuiet<T = unknown>(db: Admin, fn: string, args: Record<string, unknown>): Promise<T | null> {
+  try {
+    const { data, error } = await db.rpc(fn, args);
+    return error ? null : (data as T);
+  } catch {
+    return null;
+  }
+}
+
+function addTokens(tally: Tally | undefined, data: unknown) {
+  const t = (data as { usage?: { total_tokens?: unknown } } | null)?.usage?.total_tokens;
+  if (tally && typeof t === "number" && Number.isFinite(t)) tally.tokens += t;
+}
+
+// ── circuit breaker (state in the database; see migration 034) ──
+const CB = { threshold: 4, windowSecs: 30, openSecs: 25, probeSecs: 10 };
+
+function guarded<T>(
+  db: Admin | null, name: string, sim: string | null, fn: () => Promise<T>, simOk?: T,
+): Promise<T> {
+  const store = db
+    ? {
+        allow: async () =>
+          ((await rpcQuiet<string>(db, "ai_circuit_allow", { p_name: name, p_probe_secs: CB.probeSecs })) ?? "closed") as "closed" | "open" | "probe",
+        report: async (ok: boolean) => {
+          await rpcQuiet(db, "ai_circuit_report", { p_name: name, p_ok: ok, p_threshold: CB.threshold, p_window_secs: CB.windowSecs, p_open_secs: CB.openSecs });
+        },
+      }
+    : null;
+  return guardedCall(store, sim, fn, simOk);
+}
+
+// ── response cache with single-flight (state in the database) ──
+type CacheSpec = { key: string; scope: string; action: string; ttl: number };
+
+async function withCache(
+  db: Admin | null, spec: CacheSpec | null, produce: () => Promise<NarrateResponse>,
+): Promise<NarrateResponse> {
+  if (!db || !spec) return produce();
+  const claim = await rpcQuiet<{ status?: string; value?: Partial<NarrateResponse> }>(db, "ai_cache_claim", {
+    p_key: spec.key, p_scope: spec.scope, p_action: spec.action, p_ttl_secs: spec.ttl, p_lock_secs: 30,
+  });
+  if (!claim || claim.status === "bypass") return produce();
+  if (claim.status === "hit" && claim.value) return base({ ...claim.value, cache: "hit" });
+  if (claim.status === "wait") {
+    const until = Date.now() + 25000;
+    while (Date.now() < until) {
+      await sleep(350);
+      const v = await rpcQuiet<Partial<NarrateResponse>>(db, "ai_cache_get", { p_key: spec.key, p_scope: spec.scope });
+      if (v) return base({ ...v, cache: "wait" });
+    }
+    return produce();
+  }
+  let out: NarrateResponse;
+  try {
+    out = await produce();
+  } catch (e) {
+    await rpcQuiet(db, "ai_cache_release", { p_key: spec.key });
+    throw e;
+  }
+  if (!out.fallback && !out.degraded) {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { ok: _o, version: _v, fallback: _f, cache: _c, tokens: _t, error: _e, ...value } = out;
+    await rpcQuiet(db, "ai_cache_put", { p_key: spec.key, p_value: value, p_ttl_secs: spec.ttl });
+    return { ...out, cache: "miss" };
+  }
+  await rpcQuiet(db, "ai_cache_release", { p_key: spec.key });
+  return out;
 }
 
 function systemPrompt(locale: string): string {
@@ -214,10 +305,10 @@ function parseModelJson(content: string): unknown {
  * (they override MUSE_*). Muse needs minimal reasoning + max_completion_tokens;
  * Gemini's OpenAI endpoint takes plain max_tokens.
  */
-function tokenParams(baseUrl: string): Record<string, unknown> {
-  if (baseUrl.includes("generativelanguage.googleapis.com")) return { max_tokens: 1500 };
-  if (baseUrl.includes("api.meta.ai")) return { reasoning_effort: "minimal", max_completion_tokens: 1200 };
-  return { max_tokens: 1500 };
+function tokenParams(baseUrl: string, maxTokens?: number): Record<string, unknown> {
+  if (baseUrl.includes("generativelanguage.googleapis.com")) return { max_tokens: maxTokens ?? 1500 };
+  if (baseUrl.includes("api.meta.ai")) return { reasoning_effort: "minimal", max_completion_tokens: maxTokens ?? 1200 };
+  return { max_tokens: maxTokens ?? 1500 };
 }
 
 async function callMuse(
@@ -225,43 +316,75 @@ async function callMuse(
   apiKey: string,
   model: string,
   req: NarrateRequest,
+  tally?: Tally,
+  opts?: Partial<FetchOpts> & { maxTokens?: number },
 ): Promise<unknown> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      signal: ctrl.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+  const deadlineAt = opts?.deadlineAt ?? Date.now() + 20000;
+  const attempt = async (repair: boolean): Promise<unknown> => {
+    const res = await modelFetch(
+      `${baseUrl}/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt(req.locale ?? "en") + (repair ? " Reply with ONLY one compact JSON object. Keep your reasoning very short." : "") },
+            { role: "user", content: userPrompt(req) },
+          ],
+          ...tokenParams(baseUrl, repair ? (opts?.maxTokens ?? 1200) * 2 : opts?.maxTokens),
+          response_format: { type: "json_object" },
+          temperature: repair ? 0.3 : 0.8,
+        }),
       },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt(req.locale ?? "en") },
-          { role: "user", content: userPrompt(req) },
-        ],
-        // Muse Spark always reasons (reasoning_effort "none" is a 400) and
-        // reasoning tokens count against the completion budget. Measured:
-        // "minimal" still spends 70–380 reasoning tokens, so a tight cap
-        // (the old 220) returns content:null. Keep a generous cap.
-        ...tokenParams(baseUrl),
-        response_format: { type: "json_object" },
-        temperature: 0.8,
-      }),
-    });
-    if (!res.ok) throw new Error(`model_http_${res.status}`);
+      { attemptMs: opts?.attemptMs ?? 12000, deadlineAt, retries: opts?.retries ?? 2, retry5xx: true },
+    );
     const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") throw new Error("model_shape");
-    return parseModelJson(content);
-  } finally {
-    clearTimeout(timer);
+    addTokens(tally, data);
+    const choice = data?.choices?.[0];
+    const content = choice?.message?.content;
+    if (typeof content !== "string") {
+      console.log(JSON.stringify({ ai_diag: "model_shape", action: req.action, repair, finish: choice?.finish_reason ?? null, usage: data?.usage ?? null }));
+      throw new Error("model_shape");
+    }
+    try {
+      return parseModelJson(content);
+    } catch (e) {
+      console.log(JSON.stringify({ ai_diag: "model_parse", action: req.action, repair, finish: choice?.finish_reason ?? null, len: content.length, head: content.slice(0, 160), tail: content.slice(-80) }));
+      throw e;
+    }
+  };
+  try {
+    return await attempt(false);
+  } catch (e) {
+    const code = modelErrorCode(e);
+    // ONE repair retry on an unusable answer (reasoning ate the token budget / truncated JSON).
+    if ((code === "model_shape" || code === "model_parse") && deadlineAt - Date.now() > 4000) return await attempt(true);
+    throw e;
   }
 }
 
-// ───────────────────────── Quest Agent + Found Card ─────────────────────────
+/** Lenient coercion of a model brief: strings or {text}, tips as array or a delimited string. */
+function strOf(v: unknown): string | null {
+  if (typeof v === "string") return v;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return strOf(o.text ?? o.tip ?? o.summary ?? o.line ?? o.value);
+  }
+  return null;
+}
+function coerceBrief(o: Record<string, unknown>) {
+  const tipsRaw: unknown[] = Array.isArray(o.tips)
+    ? o.tips
+    : typeof o.tips === "string"
+      ? o.tips.split(/\n|•|\s\d\.\s/).map((x) => x.trim()).filter(Boolean)
+      : [];
+  return {
+    summary: cleanLine(strOf(o.summary ?? o.overview), 320),
+    tips: tipsRaw.map((t) => cleanLine(strOf(t), 180)).filter((t): t is string => t !== null).slice(0, 3),
+    best_time: cleanLine(strOf(o.best_time ?? o.bestTime), 200) ?? undefined,
+  };
+}
 
 type Candidate = { id: string; type: string; walk_minutes: number; social: boolean };
 type Availability = { ok: boolean; reason: string | null; sponsored: boolean; business: string | null; category: string | null };
@@ -447,7 +570,7 @@ const QUEST_TOOLS = [
     type: "function",
     function: {
       name: "get_context",
-      description: "Get the walker's mood text, time budget in minutes, and preferred language.",
+      description: "Walker mood, time budget, language.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -455,7 +578,7 @@ const QUEST_TOOLS = [
     type: "function",
     function: {
       name: "get_history",
-      description: "Get the walker's recently found drop types (most recent first) and their current day streak, to add variety.",
+      description: "Recently found drop types and streak.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -463,7 +586,7 @@ const QUEST_TOOLS = [
     type: "function",
     function: {
       name: "get_time",
-      description: "Get the walker's local part of day (morning, afternoon, evening, night) and hour.",
+      description: "Local part of day and hour.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -472,7 +595,7 @@ const QUEST_TOOLS = [
     function: {
       name: "list_candidates",
       description:
-        "List nearby mystery Drops (metadata only) with walking minutes, a sponsored flag, the venue category when it is a Business drop, and a `fit` score (higher = better match for this walker's mood and time of day). Optionally filter by drop type and max walking minutes.",
+        "Nearby drops: id, type, walk_minutes, sponsored, category, available, fit (higher = better match).",
       parameters: {
         type: "object",
         properties: {
@@ -488,7 +611,7 @@ const QUEST_TOOLS = [
     function: {
       name: "check_availability",
       description:
-        "Check with the server whether candidate drops are still active and not time-locked. Call with the ids you plan to use (or none for all). Never pick a drop reported unavailable.",
+        "Server check that drops are still active and not time-locked. Call with no ids for all.",
       parameters: {
         type: "object",
         properties: { drop_ids: { type: "array", items: { type: "string" } } },
@@ -501,7 +624,7 @@ const QUEST_TOOLS = [
     function: {
       name: "submit_quest",
       description:
-        "Submit the final quest: 1-3 ordered stops chosen ONLY from list_candidates that check_availability reports available, each with a one-line mysterious teaser that never reveals content. At most ONE stop may have sponsored=true. Call exactly once, last.",
+        "Final quest: 1-3 stops from list_candidates that are available; teaser + why per stop. At most ONE sponsored. Call once, last.",
       parameters: {
         type: "object",
         properties: {
@@ -515,7 +638,7 @@ const QUEST_TOOLS = [
               properties: {
                 drop_id: { type: "string" },
                 teaser: { type: "string", description: "max 15 words" },
-                why: { type: "string", description: "why this stop fits the walker's mood and time of day, max 14 words; never mention sponsorship" },
+                why: { type: "string", description: "max 14 words; never mention sponsorship" },
               },
               required: ["drop_id", "teaser", "why"],
             },
@@ -533,44 +656,33 @@ async function museChat(
   model: string,
   messages: unknown[],
   tools: unknown[],
+  tally: Tally,
+  deadlineAt: number,
 ): Promise<Record<string, unknown>> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
+  const res = await modelFetch(
+    `${baseUrl}/chat/completions`,
+    {
       method: "POST",
-      signal: ctrl.signal,
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        messages,
-        tools,
-        tool_choice: "auto",
-        ...tokenParams(baseUrl),
-        temperature: 0.7,
-      }),
-    });
-    if (!res.ok) throw new Error(`model_http_${res.status}`);
-    const data = await res.json();
-    const msg = data?.choices?.[0]?.message;
-    if (!msg || typeof msg !== "object") throw new Error("model_shape");
-    return msg as Record<string, unknown>;
-  } finally {
-    clearTimeout(timer);
-  }
+      body: JSON.stringify({ model, messages, tools, tool_choice: "auto", ...tokenParams(baseUrl), temperature: 0.7 }),
+    },
+    { attemptMs: 15000, deadlineAt, retries: 2, retry5xx: true },
+  );
+  const data = await res.json();
+  addTokens(tally, data);
+  const msg = data?.choices?.[0]?.message;
+  if (!msg || typeof msg !== "object") throw new Error("model_shape");
+  return msg as Record<string, unknown>;
 }
 
-/**
- * Real agent loop: Muse decides which tools to call (context → candidates →
- * submit). Every tool result is computed here from validated data; the final
- * plan is re-validated before it leaves the server.
- */
 type QuestEnv = {
   availability: Map<string, Availability>;
   localHour: number | null;
   mood: Mood | null;
   fit: Map<string, FitInfo>;
   history: () => Promise<{ recent_types: string[]; recent_categories: string[]; streak_days: number }>;
+  tally: Tally;
+  deadlineAt: number;
 };
 
 function partOfDay(hour: number | null): string {
@@ -596,26 +708,28 @@ async function runQuestAgent(
     {
       role: "system",
       content: [
-        "You are DROQ's Quest Agent. Plan a short outdoor walk by discovering nearby mystery Drops.",
-        "You MUST use tools: get_context, get_history, get_time, list_candidates, then check_availability for the drops you plan to use, then submit_quest.",
-        "Prefer candidates with a higher `fit` score, variety versus the walker's recent types, and a mood that fits the part of day. For every stop write `why`: one short line on why it fits this walker right now. Skip any drop reported unavailable.",
-        "At most ONE stop may be sponsored (sponsored=true); include it only if it truly fits, otherwise none. Never mention sponsorship, brands or names in teasers.",
-        `Write title and teasers in ${lang}. Warm, mysterious, no emojis.`,
-        "Never mention coordinates, meters, addresses or place names. Never invent drop ids.",
-        "Respect the time budget: pick stops whose walking minutes fit, nearest-first.",
+        "You are DROQ's Quest Agent. Plan a 1-3 stop walk of nearby mystery Drops.",
+        "In ONE step call get_context, get_history, get_time, list_candidates and check_availability together (in parallel), then call submit_quest.",
+        "Prefer higher `fit`, varied types, and stops that suit the mood and time; skip unavailable drops. At most ONE sponsored stop, only if it fits; never mention sponsorship or names.",
+        "For each stop give a short teaser and a short why (max 14 words).",
+        `Write in ${lang}, warm, no emojis, no coordinates, no place names. Never invent ids.`,
       ].join(" "),
     },
     { role: "user", content: "Plan my quest." },
   ];
   const trace: string[] = [];
   const byId = new Map(cands.map((c) => [c.id, c]));
+  const shortOf = new Map(cands.map((c, i) => [c.id, `c${i + 1}`]));
+  const fromShort = new Map(cands.map((c, i) => [`c${i + 1}`, c.id]));
+  const resolveId = (x: string) => fromShort.get(x) ?? x;
   const okIds = (ids?: unknown): string[] => {
-    const want = Array.isArray(ids) ? ids.filter((x): x is string => typeof x === "string") : [...byId.keys()];
+    const want = Array.isArray(ids) ? ids.filter((x): x is string => typeof x === "string").map(resolveId) : [...byId.keys()];
     return want.filter((id) => byId.has(id));
   };
 
-  for (let turn = 0; turn < 8; turn++) {
-    const msg = await museChat(baseUrl, apiKey, model, messages, QUEST_TOOLS);
+  for (let turn = 0; turn < 5; turn++) {
+    if (Date.now() > env.deadlineAt) throw new Error("agent_deadline");
+    const msg = await museChat(baseUrl, apiKey, model, messages, QUEST_TOOLS, env.tally, env.deadlineAt);
     const calls = Array.isArray(msg.tool_calls) ? (msg.tool_calls as Record<string, unknown>[]) : [];
     if (calls.length === 0) throw new Error("agent_no_tool");
     messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: calls });
@@ -640,7 +754,7 @@ async function runQuestAgent(
         for (const s of rawSteps.slice(0, 10)) {
           if (steps.length >= 3) break;
           const o = s as Record<string, unknown>;
-          const id = typeof o?.drop_id === "string" ? o.drop_id : "";
+          const id = resolveId(typeof o?.drop_id === "string" ? o.drop_id : "");
           const teaser = cleanLine(o?.teaser, 100);
           const av = env.availability.get(id);
           // Server is authoritative: only real, available drops; at most one sponsored stop.
@@ -662,6 +776,27 @@ async function runQuestAgent(
           });
         }
         if (!title || steps.length === 0) throw new Error("agent_bad_plan");
+        // Paid placement: if the model skipped an available sponsored stop that clearly fits
+        // (top 3 by fit for this walker), include it. Never invented: it comes from the verified set.
+        if (env.mood && !steps.some((st) => st.sponsored)) {
+          const byFit = [...cands].sort((a, b) => (env.fit.get(b.id)?.score ?? 0) - (env.fit.get(a.id)?.score ?? 0));
+          const best = byFit.find((c) => { const av = env.availability.get(c.id); return av?.ok && av.sponsored && !used.has(c.id); });
+          const topScore = env.fit.get(byFit[0]?.id ?? "")?.score ?? 0;
+          if (best && topScore - (env.fit.get(best.id)?.score ?? 0) <= 4) {
+            const av = env.availability.get(best.id)!;
+            const f = env.fit.get(best.id);
+            const step = {
+              drop_id: best.id,
+              teaser: TEASER[locale === "bn" ? "bn" : "en"][best.type] ?? TEASER.en.memory,
+              ...(f ? { why: whyText(f.why, env.mood, asPart(partOfDay(env.localHour)), locale) } : {}),
+              sponsored: true,
+              ...(av.business ? { business: av.business } : {}),
+            };
+            if (steps.length >= 3) steps.pop();
+            steps.push(step);
+            steps.sort((a, b) => byId.get(a.drop_id)!.walk_minutes - byId.get(b.drop_id)!.walk_minutes);
+          }
+        }
         const far = Math.max(...steps.map((s) => byId.get(s.drop_id)!.walk_minutes));
         return { quest: { title, steps, minutes: far }, trace };
       }
@@ -679,10 +814,10 @@ async function runQuestAgent(
         result = cands
           .filter((c) => (!t || c.type === t) && c.walk_minutes <= mx)
           .map((c) => ({
-            id: c.id,
+            id: shortOf.get(c.id),
             type: c.type,
             walk_minutes: c.walk_minutes,
-            social: c.social,
+            available: env.availability.get(c.id)?.ok === true,
             sponsored: env.availability.get(c.id)?.sponsored === true,
             ...(env.availability.get(c.id)?.category ? { category: env.availability.get(c.id)!.category } : {}),
             fit: env.fit.get(c.id)?.score ?? null,
@@ -690,7 +825,7 @@ async function runQuestAgent(
       } else if (name === "check_availability") {
         result = okIds(args.drop_ids).map((id) => {
           const av = env.availability.get(id);
-          return { id, available: av?.ok === true, reason: av?.reason ?? null };
+          return { id: shortOf.get(id), available: av?.ok === true, reason: av?.reason ?? null };
         });
       } else {
         result = { error: "unknown_tool" };
@@ -770,13 +905,12 @@ async function museImage(
     `Square poster-style illustration for a real-world treasure hunt app: someone has just found ${theme} ` +
     "hidden in a quiet city street at dusk. Cinematic, minimal, deep navy and teal with warm amber light, " +
     "soft film grain. No text, no letters, no logos, no faces.";
-  const post = async (extra: Record<string, unknown>) => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 40000);
-    try {
-      return await fetch(`${baseUrl}/images/generations`, {
+  // Image generation is billable and not idempotent: retry only a 429 (rejected, not processed), never 5xx/timeouts.
+  const post = (extra: Record<string, unknown>) =>
+    modelFetch(
+      `${baseUrl}/images/generations`,
+      {
         method: "POST",
-        signal: ctrl.signal,
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: imgModel,
@@ -785,22 +919,20 @@ async function museImage(
           ...(isMuse ? { size: "1024x1024" } : { response_format: "b64_json" }),
           ...extra,
         }),
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  // Documented extensions: keep the agent cheap/fast and offline from the web.
-  let res = await post(
-    isMuse
-      ? {
-          reasoning_strength: "low",
-          tool_enablement: { enable_image_search: false, enable_web_search: false, enable_shell: false },
-        }
-      : {},
-  );
-  if (isMuse && res.status === 400) res = await post({}); // endpoint rejected extensions → plain call
-  if (!res.ok) throw new Error(`model_http_${res.status}`);
+      },
+      { attemptMs: 40000, deadlineAt: Date.now() + 45000, retries: 1, retry5xx: false },
+    );
+  let res: Response;
+  try {
+    res = await post(
+      isMuse
+        ? { reasoning_strength: "low", tool_enablement: { enable_image_search: false, enable_web_search: false, enable_shell: false } }
+        : {},
+    );
+  } catch (e) {
+    if (isMuse && e instanceof Error && e.message === "model_http_400") res = await post({});
+    else throw e;
+  }
   const data = await res.json();
   const first = data?.data?.[0] as { b64_json?: unknown; url?: unknown } | undefined;
   if (typeof first?.b64_json === "string" && first.b64_json.length < 4_000_000) {
@@ -810,7 +942,6 @@ async function museImage(
   throw new Error("model_shape");
 }
 
-/** Shared, DB-backed limit (fails open to the isolate throttle on RPC error). */
 async function dbRateOk(
   admin: ReturnType<typeof createClient>,
   userId: string,
@@ -828,16 +959,7 @@ async function dbRateOk(
   return data !== false;
 }
 
-function modelErrorCode(e: unknown): string {
-  if (e instanceof Error) {
-    if (e.name === "AbortError") return "model_timeout";
-    if (/^(model_http_\d+|model_shape|agent_[a-z_]+)$/.test(e.message)) return e.message;
-    if (e instanceof SyntaxError) return "model_parse";
-  }
-  return "model_error";
-}
-
-Deno.serve(async (req) => {
+async function handle(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
@@ -871,6 +993,16 @@ Deno.serve(async (req) => {
     return json({ ...fallback(), error: "bad_action" }, 400);
   }
   const locale = body.locale === "bn" ? "bn" : "en";
+  const J = (b: NarrateResponse, status = 200): Response => {
+    const r = json(b, status);
+    r.headers.set("x-ai-uid", user.id);
+    r.headers.set("x-ai-act", body.action);
+    return r;
+  };
+  // Test hook: honoured only for @loadtest.invalid users and routed to an isolated breaker.
+  const sim = (user.email ?? "").endsWith("@loadtest.invalid") && (body._sim === "fail" || body._sim === "ok") ? body._sim : null;
+  const cname = sim ? "meta-sim" : "meta";
+  const tally: Tally = { tokens: 0 };
 
   // Shared DB-backed limits (per-isolate throttle above can't see other isolates).
   const svcKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -884,14 +1016,14 @@ Deno.serve(async (req) => {
       : body.action === "business_brief" ? ["brief", 10, 3600]
       : ["text", 40, 60];
     if (!(await dbRateOk(limiter, user.id, bucket as string, limit as number, win as number))) {
-      return json({ ...fallback(), error: "rate_limited" }, 429);
+      return J({ ...fallback(), error: "rate_limited" }, 429);
     }
     // Global daily caps across ALL users: open signup must not be able to burn the model budget.
     const globalCap: Record<string, number> = { image: 300, quest: 1500, brief: 1000 };
     if (globalCap[bucket as string]) {
       const GLOBAL = "00000000-0000-0000-0000-000000000000";
       if (!(await dbRateOk(limiter, GLOBAL, `${bucket}_global`, globalCap[bucket as string], 86400))) {
-        return json({ ...fallback(), error: "budget_cap" }, 429);
+        return J({ ...fallback(), error: "budget_cap" }, 429);
       }
     }
   }
@@ -902,7 +1034,7 @@ Deno.serve(async (req) => {
 
   if (body.action === "quest_plan") {
     let cands = parseCandidates(body.candidates);
-    if (cands.length === 0) return json({ ...fallback(), error: "no_candidates" }, 400);
+    if (cands.length === 0) return J({ ...fallback(), error: "no_candidates" }, 400);
     // Server truth for every candidate: exists, active, not time-locked/expired, business flag.
     const availability = new Map<string, Availability>();
     if (limiter) {
@@ -931,7 +1063,7 @@ Deno.serve(async (req) => {
       }
       cands = cands.filter((c) => availability.has(c.id));
       if (cands.length === 0 || ![...availability.values()].some((a) => a.ok)) {
-        return json({ ...fallback(), error: "bad_drop" }, 404);
+        return J({ ...fallback(), error: "bad_drop" }, 404);
       }
     } else {
       for (const c of cands) availability.set(c.id, { ok: true, reason: null, sponsored: false, business: null, category: null });
@@ -979,9 +1111,8 @@ Deno.serve(async (req) => {
     if (mood) {
       for (const c of cands) fit.set(c.id, scoreFit(c, availability.get(c.id)?.category ?? null, mood, part, hist.recent_types));
     }
-    const env: QuestEnv = { availability, localHour, mood, fit, history: loadHistory };
+    const env: QuestEnv = { availability, localHour, mood, fit, history: loadHistory, tally, deadlineAt: Date.now() + 45000 };
 
-    // Server-side funnel log: the sponsored stop was shown to this walker.
     const logShown = async (q: NonNullable<NarrateResponse["quest"]>) => {
       if (!limiter) return;
       try {
@@ -996,63 +1127,99 @@ Deno.serve(async (req) => {
       } catch { /* analytics must never block */ }
     };
 
-    try {
-      if (!apiKey0) throw new Error("model_error"); // no key → deterministic rules plan below
-      const { quest, trace } = await runQuestAgent(base0, apiKey0, model0, cands, intent, minutes, locale, env);
-      await logShown(quest);
-      return json(base({ quest, trace, engine: "agent" }));
-    } catch (e) {
-      // Model down / bad plan: deterministic rules engine, same matching tables.
-      const rules = rulesPlan(cands, minutes, locale, env);
-      if (rules) {
-        await logShown(rules);
-        return json(base({ quest: rules, trace: [], engine: "rules" }));
+    // Short-TTL cache absorbs double taps; per-user scope, no coordinates in the key or value.
+    const spec: CacheSpec | null =
+      limiter && !sim
+        ? {
+            key: `quest:${user.id}:${await sha(JSON.stringify([
+              cands.map((c) => [c.id, c.type, c.walk_minutes]).sort(), minutes, intent, mood,
+              localHour === null ? null : Math.floor(localHour / 3), locale,
+            ]))}`,
+            scope: user.id, action: "quest_plan", ttl: 60,
+          }
+        : null;
+
+    const produce = async (): Promise<NarrateResponse> => {
+      try {
+        if (!apiKey0) throw new Error("model_error");
+        const { quest, trace } = await guarded(
+          limiter, cname, sim, () => runQuestAgent(base0, apiKey0, model0, cands, intent, minutes, locale, env),
+        );
+        await logShown(quest);
+        return base({ quest, trace, engine: "agent", tokens: tally.tokens });
+      } catch (e) {
+        const code = modelErrorCode(e);
+        const rules = rulesPlan(cands, minutes, locale, env);
+        if (rules) {
+          await logShown(rules);
+          return base({ quest: rules, trace: [], engine: "rules", degraded: true, error: !apiKey0 ? "missing_key" : code, tokens: tally.tokens });
+        }
+        return { ...fallback(), error: code, degraded: isDegraded(code) || undefined };
       }
-      return json({ ...fallback(), error: modelErrorCode(e) });
-    }
+    };
+    return J(await withCache(limiter, spec, produce));
   }
 
   if (body.action === "business_brief") {
     const agg = parseAggregates(body.aggregates);
-    if (!agg) return json({ ...fallback(), error: "bad_aggregates" }, 400);
-    if (!apiKey0) return json({ ...fallback(), error: "missing_key" });
-    try {
-      const parsedBrief = await callMuse(base0, apiKey0, model0, { ...body, locale, aggregates: agg });
-      const o = (parsedBrief && typeof parsedBrief === "object" ? parsedBrief : {}) as Record<string, unknown>;
-      const summary = cleanLine(o.summary, 320);
-      const tips = (Array.isArray(o.tips) ? o.tips : [])
-        .map((t) => cleanLine(t, 180))
-        .filter((t): t is string => t !== null)
-        .slice(0, 3);
-      const best_time = cleanLine(o.best_time, 200) ?? undefined;
-      if (!summary || tips.length < 3) return json({ ...fallback(), error: "model_empty" });
-      return json(base({ brief: { summary, tips, ...(best_time ? { best_time } : {}) } }));
-    } catch (e) {
-      return json({ ...fallback(), error: modelErrorCode(e) });
-    }
+    if (!agg) return J({ ...fallback(), error: "bad_aggregates" }, 400);
+    if (!apiKey0) return J({ ...fallback(), error: "missing_key" });
+    // One brief per owner per day per language per data snapshot: repeat views are instant.
+    const day = new Date().toISOString().slice(0, 10);
+    const spec: CacheSpec | null =
+      limiter && !sim
+        ? { key: `brief:${user.id}:${day}:${locale}:${await sha(JSON.stringify(agg))}`, scope: user.id, action: "business_brief", ttl: 86400 }
+        : null;
+    const produce = async (): Promise<NarrateResponse> => {
+      try {
+        const parsedBrief = await guarded(
+          limiter, cname, sim,
+          () => callMuse(base0, apiKey0, model0, { ...body, locale, aggregates: agg }, tally, { attemptMs: 25000, deadlineAt: Date.now() + 30000, retries: 1, maxTokens: 2400 }),
+          { summary: "sim", tips: ["a", "b", "c"] },
+        );
+        let c = coerceBrief((parsedBrief && typeof parsedBrief === "object" ? parsedBrief : {}) as Record<string, unknown>);
+        if (!c.summary || c.tips.length < 3) {
+          // schema miss: one repair retry with a bigger budget before giving up
+          const again = await guarded(
+            limiter, cname, sim,
+            () => callMuse(base0, apiKey0, model0, { ...body, locale, aggregates: agg }, tally, { attemptMs: 25000, deadlineAt: Date.now() + 20000, retries: 0, maxTokens: 3000 }),
+            { summary: "sim", tips: ["a", "b", "c"] },
+          );
+          c = coerceBrief((again && typeof again === "object" ? again : {}) as Record<string, unknown>);
+        }
+        const { summary, tips, best_time } = c;
+        if (!summary || tips.length < 3) return { ...fallback(), error: "model_empty" };
+        return base({ brief: { summary, tips, ...(best_time ? { best_time } : {}) }, tokens: tally.tokens });
+      } catch (e) {
+        const code = modelErrorCode(e);
+        return { ...fallback(), error: code, degraded: isDegraded(code) || undefined };
+      }
+    };
+    return J(await withCache(limiter, spec, produce));
   }
 
   if (body.action === "found_card") {
-    if (!body.drop_id) return json({ ...fallback(), error: "missing_drop" }, 400);
+    if (!body.drop_id) return J({ ...fallback(), error: "missing_drop" }, 400);
     if (limiter) {
       const { data: d } = await limiter.from("drops").select("id,status").eq("id", body.drop_id).maybeSingle();
       if (!d || (d as { status: string }).status !== "active") {
-        return json({ ...fallback(), error: "bad_drop" }, 404);
+        return J({ ...fallback(), error: "bad_drop" }, 404);
       }
     }
-    if (!apiKey0) return json({ ...fallback(), error: "missing_key" });
+    if (!apiKey0) return J({ ...fallback(), error: "missing_key" });
     try {
-      const image = await museImage(base0, apiKey0, typeof body.drop_type === "string" ? body.drop_type : "memory");
-      return json(base({ image }));
+      const image = await guarded(limiter, "meta", null, () => museImage(base0, apiKey0, typeof body.drop_type === "string" ? body.drop_type : "memory"));
+      return J(base({ image }));
     } catch (e) {
-      return json({ ...fallback(), error: modelErrorCode(e) });
+      const code = modelErrorCode(e);
+      return J({ ...fallback(), error: code, degraded: isDegraded(code) || undefined });
     }
   }
 
   // Re-validate the drop server-side (exists + active). Proximity stays
   // enforced by unlock_drop at unlock time, as today.
   if (body.action !== "clue_options") {
-    if (!body.drop_id) return json({ ...fallback(), error: "missing_drop" }, 400);
+    if (!body.drop_id) return J({ ...fallback(), error: "missing_drop" }, 400);
     // Status-only lookup must see other creators' undiscovered drops (a Sense
     // pick is undiscovered by definition), so prefer the service-role key
     // (auto-injected env). Selects id+status only — still metadata, never
@@ -1067,7 +1234,7 @@ Deno.serve(async (req) => {
       .eq("id", body.drop_id)
       .maybeSingle();
     if (!drop || (drop as { status: string }).status !== "active") {
-      return json({ ...fallback(), error: "bad_drop" }, 404);
+      return J({ ...fallback(), error: "bad_drop" }, 404);
     }
     // Funnel: a Business drop was surfaced to this walker by Sense (server-side, trustworthy).
     if (body.action === "sense_reason" && (drop as { is_business?: boolean }).is_business && limiter) {
@@ -1079,58 +1246,90 @@ Deno.serve(async (req) => {
       } catch { /* analytics must never block */ }
     }
   } else if (!body.draft || body.draft.trim().length < 2) {
-    return json({ ...fallback(), error: "missing_draft" }, 400);
+    return J({ ...fallback(), error: "missing_draft" }, 400);
   }
 
   const apiKey = (Deno.env.get("LLM_API_KEY") || Deno.env.get("MUSE_API_KEY")) ?? "";
   // No key (local dev / CI) → client uses templates. Never fail the flow.
-  if (!apiKey) return json({ ...fallback(), error: "missing_key" });
+  if (!apiKey) return J({ ...fallback(), error: "missing_key" });
 
   const model = (Deno.env.get("LLM_MODEL") || Deno.env.get("MUSE_MODEL")) || "muse-spark-1.3";
   // Meta Muse API (dev.meta.ai/docs): OpenAI-compatible at api.meta.ai —
   // the OpenAI SDK pointed at this base calls /chat/completions.
   const baseUrl = ((Deno.env.get("LLM_BASE_URL") || Deno.env.get("MUSE_BASE_URL")) || "https://api.meta.ai/v1").replace(/\/$/, "");
 
-  let parsed: unknown;
-  try {
-    parsed = await callMuse(baseUrl, apiKey, model, { ...body, locale });
-  } catch (e) {
-    // Controlled codes only (model_http_<status>, model_shape, model_timeout,
-    // model_parse) — never leak key material or response bodies.
-    let code = "model_error";
-    if (e instanceof Error) {
-      if (e.name === "AbortError") code = "model_timeout";
-      else if (e.message.startsWith("model_http_") || e.message === "model_shape") code = e.message;
-      else if (e instanceof SyntaxError) code = "model_parse";
+  const level = Math.min(Math.max(body.context?.hint_level ?? 1, 1), 4);
+  let spec: CacheSpec | null = null;
+  if (limiter && !sim) {
+    if (body.action === "hunt_hint") {
+      spec = { key: `hint:${body.drop_id}:${level}:${locale}:${body.context?.distance_bucket ?? "na"}`, scope: "global", action: "hunt_hint", ttl: 600 };
+    } else if (body.action === "clue_options") {
+      spec = {
+        key: `clue:${user.id}:${await sha(JSON.stringify([body.draft, body.drop_type, locale, body.business === true, body.business_name ?? ""]))}`,
+        scope: user.id, action: "clue_options", ttl: 600,
+      };
     }
-    return json({ ...fallback(), error: code });
   }
 
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return json({ ...fallback(), error: "model_parse" });
+  const produce = async (): Promise<NarrateResponse> => {
+    let parsed: unknown;
+    try {
+      parsed = await guarded(limiter, cname, sim, () => callMuse(baseUrl, apiKey, model, { ...body, locale }, tally), { reason: "ok", hint: "ok", line: "ok" });
+    } catch (e) {
+      const code = modelErrorCode(e);
+      return { ...fallback(), error: code, degraded: isDegraded(code) || undefined };
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { ...fallback(), error: "model_parse" };
+    }
+    const obj = parsed as Record<string, unknown>;
+    if (body.action === "clue_options") {
+      const raw = Array.isArray(obj.options) ? obj.options : [];
+      const options = raw
+        .map((o) => cleanLine(o, MAX_OPTION))
+        .filter((o): o is string => o !== null)
+        .slice(0, 3);
+      const sv = obj.safety as { verdict?: unknown; note?: unknown } | undefined;
+      const verdict = sv?.verdict === "blocked" || sv?.verdict === "risky" ? sv.verdict : "ok";
+      if (options.length === 0) return { ...fallback(), error: "model_empty" };
+      return base({ options, safety: { verdict, note: cleanLine(sv?.note, MAX_TEXT) ?? undefined }, tokens: tally.tokens });
+    }
+    const text = cleanLine(obj.reason ?? obj.hint ?? obj.line, MAX_TEXT);
+    if (!text) return { ...fallback(), error: "model_empty" };
+    return base({ text, tokens: tally.tokens });
+  };
+  return J(await withCache(limiter, spec, produce));
+}
+
+Deno.serve(async (req) => {
+  const t0 = Date.now();
+  const res = await handle(req);
+  const uid = res.headers.get("x-ai-uid");
+  const action = res.headers.get("x-ai-act");
+  if (uid && action) {
+    const url = Deno.env.get("SUPABASE_URL");
+    const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (url && key) {
+      const latency = Date.now() - t0;
+      const task = (async () => {
+        try {
+          const db = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+          await db.rpc("ai_call_log", {
+            p_user: uid, p_action: action, p_latency_ms: latency,
+            p_fallback: res.headers.get("x-ai-fb") === "1", p_cache: res.headers.get("x-ai-cache"),
+            p_degraded: res.headers.get("x-ai-deg") === "1", p_error: res.headers.get("x-ai-err"),
+            p_tokens: Number(res.headers.get("x-ai-tok") ?? 0) || null,
+          });
+          if (Math.random() < 0.01) await db.rpc("ai_cleanup");
+        } catch { /* telemetry must never break a response */ }
+      })();
+      // deno-lint-ignore no-explicit-any
+      const er = (globalThis as any).EdgeRuntime;
+      if (er?.waitUntil) er.waitUntil(task);
+      else await task;
+    }
   }
-  const obj = parsed as Record<string, unknown>;
-  if (body.action === "clue_options") {
-    const raw = Array.isArray(obj.options) ? obj.options : [];
-    const options = raw
-      .map((o) => cleanLine(o, MAX_OPTION))
-      .filter((o): o is string => o !== null)
-      .slice(0, 3);
-    const s = obj.safety as { verdict?: unknown; note?: unknown } | undefined;
-    const verdict =
-      s?.verdict === "blocked" || s?.verdict === "risky" ? s.verdict : "ok";
-    if (options.length === 0) return json({ ...fallback(), error: "model_empty" });
-    return json(
-      base({
-        options,
-        safety: {
-          verdict,
-          note: cleanLine(s?.note, MAX_TEXT) ?? undefined,
-        },
-      }),
-    );
-  }
-  const text = cleanLine(obj.reason ?? obj.hint ?? obj.line, MAX_TEXT);
-  if (!text) return json({ ...fallback(), error: "model_empty" });
-  return json(base({ text }));
+  res.headers.delete("x-ai-uid");
+  res.headers.delete("x-ai-act");
+  return res;
 });

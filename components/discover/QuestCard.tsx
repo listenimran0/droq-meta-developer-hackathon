@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useI18n } from '@/hooks/useI18n';
 import { useTheme } from '@/hooks/useTheme';
@@ -39,6 +39,18 @@ export function QuestCard({ signals, onOpenDrop, recentTypes }: Props) {
   const [busy, setBusy] = useState(false);
   const [quest, setQuest] = useState<Quest | null>(null);
   const [failed, setFailed] = useState(false);
+  const [phase, setPhase] = useState(0);
+
+  // Timer-driven progress steps so the wait never looks frozen.
+  useEffect(() => {
+    if (!busy) {
+      setPhase(0);
+      return;
+    }
+    const id = setInterval(() => setPhase((p) => Math.min(p + 1, 3)), 3000);
+    return () => clearInterval(id);
+  }, [busy]);
+  const stepKeys = ['questStep1', 'questStep2', 'questStep3', 'questStep4'] as const;
 
   const timeKey = { 15: 'questTime15', 30: 'questTime30', 60: 'questTime60' } as const;
   const moodKey = {
@@ -141,6 +153,17 @@ export function QuestCard({ signals, onOpenDrop, recentTypes }: Props) {
               <Text style={styles.ctaText}>{t('questCta')}</Text>
             )}
           </Pressable>
+
+          {busy ? (
+            <View style={styles.progress} accessibilityLiveRegion="polite">
+              {stepKeys.slice(0, phase + 1).map((k, i) => (
+                <Text key={k} style={[styles.muted, i < phase && { opacity: 0.55 }]}>
+                  {i < phase ? '✓ ' : '• '}
+                  {t(k)}
+                </Text>
+              ))}
+            </View>
+          ) : null}
 
           {failed ? <Text style={styles.muted}>{t('questEmpty')}</Text> : null}
 
@@ -257,6 +280,7 @@ function createStyles(colors: ThemeColors, locale: 'en' | 'bn') {
       color: colors.bg,
       textAlign: 'center',
     },
+    progress: { gap: space.xs },
     result: { gap: space.sm },
     title: {
       fontFamily: typography.bodyMedium,

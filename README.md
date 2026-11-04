@@ -19,6 +19,7 @@ DROQ is a mysterious digital layer over the physical world. Users leave digital 
 - **Muse Image share card**: a branded 4:5 card (Muse image, headline, epilogue, tagline) captured in the app and shared as an image.
 - **Business layer**: Business drops, Verified visits, Audience insights, the Sponsored funnel (suggested, opened, verified) and the Muse Business Brief.
 - **Safety and cost controls**: database-backed per-user rate limits, global daily spend caps, server-side validation of every model response, and a non-AI fallback for every feature.
+- **Production-readiness layer**: a database-backed circuit breaker around the model API, retry with backoff and `Retry-After`, a single-flight cache so identical concurrent requests share one model call, an atomic per-user rate limit, and call telemetry. Backed by a 26-scenario Muse eval suite (`scripts/muse-eval.mjs`, results in [docs/eval-results.md](docs/eval-results.md)) and a load test (`scripts/load-test.mjs`); the measurements are in the [Scaling and resilience](docs/how-it-works.md#scaling-and-resilience) and [Production telemetry](docs/how-it-works.md#production-telemetry) sections of docs/how-it-works.md. The Meta 429 and outage paths are covered by mocked tests, not live-tested.
 
 The repository history was reset for this submission; the original private repo keeps the full history.
 

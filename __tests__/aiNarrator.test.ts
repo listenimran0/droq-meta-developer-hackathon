@@ -8,6 +8,7 @@ import {
   fetchHuntHint,
   fetchSenseReason,
   sanitizeNarratorText,
+  wasLastNarratorDegraded,
 } from '../services/aiNarrator';
 
 const invokeMock = jest.fn();
@@ -221,5 +222,19 @@ describe('fetchFoundCard', () => {
     expect(invokeMock).toHaveBeenCalledTimes(1);
     invokeMock.mockResolvedValue({ data: { ok: true, fallback: false, image: { b64: '<script>' } }, error: null });
     expect(await fetchFoundCard({ dropId: 'd2', dropType: 'photo', locale: 'en' })).toBeNull();
+  });
+});
+
+describe('degraded flag reaches the client', () => {
+  it('is true when the server marks the response degraded, and resets after a healthy one', async () => {
+    invokeMock.mockResolvedValueOnce({
+      data: { ok: true, fallback: true, degraded: true, error: 'circuit_open' },
+      error: null,
+    });
+    await fetchFoundLine({ dropId: 'd1', dropType: 'memory', locale: 'en' });
+    expect(wasLastNarratorDegraded()).toBe(true);
+    invokeMock.mockResolvedValueOnce({ data: { ok: true, fallback: false, text: 'Lovely find today.' }, error: null });
+    await fetchFoundLine({ dropId: 'd2', dropType: 'memory', locale: 'en' });
+    expect(wasLastNarratorDegraded()).toBe(false);
   });
 });

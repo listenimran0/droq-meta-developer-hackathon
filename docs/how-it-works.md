@@ -54,8 +54,11 @@ scores (`engine: "rules"`), so the feature never dies.
 
 **Sponsored = paid placement.** The server alone decides which stop is
 sponsored: a verified Business drop, **at most one per quest**, never
-invented, never boosted in the score. The app labels it *Sponsored* and shows
-the business name. Unavailable (time-locked) drops are dropped by the server
+invented, never boosted in the score. If the agent leaves out an available
+sponsored drop whose fit is within 4 points of the best-fitting stop, the server
+adds it (replacing the weakest stop when the plan is full), so the placement is
+reliable but still has to fit the walker's mood and time. The app labels it
+*Sponsored* and shows the business name. Unavailable (time-locked) drops are dropped by the server
 even if the model picks them.
 
 **Sense (Muse · `sense_reason`)** — one smart pick on Home. The *ranking* is
@@ -142,3 +145,47 @@ or any content. Output is length-limited, coordinate-stripped, rate limited
 - Per-user and global daily limits live in the database (`ai_calls`).
 - Every AI feature has a non-AI fallback; the demo survives a dead network.
 - Owners can never see who visited — only counts.
+
+## Scaling and resilience
+
+What scales on its own: the edge function is stateless and Supabase runs as many instances as traffic needs, so request handling itself is not the bottleneck. What we protect is the part that does **not** scale for free: the Meta model API (rate limits, latency, spend).
+
+**What protects Meta (all state lives in Postgres, because instances share nothing):**
+
+- **Circuit breaker** (`ai_circuit`): 4 failures (timeouts, 429, 402/401/403, 5xx) inside 30 s open the circuit for 25 s. While open, requests skip the model and are served from the rules/template fallback with `degraded: true`. After the window exactly one probe is let through; a failed probe re-opens it, a successful one closes it.
+- **Retry with backoff**: exponential backoff with full jitter, honours `Retry-After`, bounded by a total deadline per request. A 429 is always retryable; 5xx/timeouts only for calls that are safe to repeat. Image generation is billable and not idempotent, so it only retries a 429.
+- **Cache + single-flight** (`ai_cache`): hunt hints (by drop, level, language, distance band), clue ideas (per user), quest plans (per user, 60 s, absorbs double taps) and the business brief (per owner, per day). Concurrent identical requests share one model call. Per-user content is scoped to that user; nothing cached contains coordinates or locked content.
+- **Limits**: per-user limits and global daily caps (image 300, quest 1500, brief 1000) are checked in `ai_rate_check`, which holds a per-user advisory lock so parallel requests cannot slip past the limit. A 7-day retention job (`ai_cleanup`) keeps `ai_calls` small.
+
+**What we measured** (against the deployed function, 18 throwaway users, text actions plus 5 image calls; `scripts/load-test.mjs`; the users and their rows were deleted afterwards and the global caps were back to full headroom):
+
+| Test | Result |
+| --- | --- |
+| Mixed load: 200 text requests, concurrency 30 | 33 s wall, ~6 requests/s; 200/200 HTTP 200, 0 server errors, 0 rate-limit rejections; p50 3.5 s, p95 10.1 s, max 15.8 s |
+| Fallbacks under load | 3 of 200, all `business_brief` (the model returned unusable content: `model_parse` / `model_shape`). Fixed in function v23: larger token budget, lenient parsing and one repair retry; a re-run of 8 concurrent briefs gave **0 of 8** fallbacks (11-20 s each) |
+| Cache on the 130 cacheable requests | 67 hits + 7 waits on another request's call = 57% served without a model call; 53 misses |
+| Single-flight: 30 concurrent identical hints from 5 users | exactly 1 model call (1 miss, 29 shared); p95 3.6 s |
+| Atomic limit: 60 concurrent requests from one user, limit 40/min | exactly 40 allowed, 20 rejected |
+| Circuit breaker (simulated failures, isolated breaker) | opened after the 4th failure; the next requests were answered in 450-475 ms with `degraded: true` instead of waiting on the model; a failed probe re-opened it; a successful probe closed it |
+| Per-user image limit: 6 concurrent image requests, limit 5/hour | 5 generated, 1 rejected |
+| Tokens | 72,923 tokens for the 200-request mixed run (reported by the model API) |
+
+Covered by mocked tests, not live-tested: Meta 429 with `Retry-After` (honoured, and bounded by the request deadline), 5xx retry with backoff, repeated failures opening the breaker, and the `degraded` flag reaching the client (`__tests__/resilience.test.ts`, `__tests__/aiNarrator.test.ts`; fake fetch, clock and circuit store). Meta never rate-limited us and there was no real outage; the live breaker run used simulated failures through a test hook that only works for load-test accounts and uses a separate breaker, so production traffic was never affected. We have no published per-token price, so there is no dollar figure; the token counts are measured.
+
+**At 100k users we would add** (planned, not measured): a queue for image generation instead of synchronous calls; read replicas for the insights queries; per-region routing of the model calls; partitioning or scheduled cleanup of `ai_calls` instead of the opportunistic cleanup; and moving the counters behind a dedicated store if the advisory-lock limiter becomes a hotspot.
+
+## Production telemetry
+
+Aggregated from `ai_calls` (one row per request, written by the edge function) over the load-test and eval traffic described above, excluding simulated breaker failures and deliberate rate-limit probes. This is test traffic against the production function, not organic user traffic.
+
+| Action | Calls | p50 ms | p95 ms | Fallback | Served from cache | Avg tokens |
+| --- | --- | --- | --- | --- | --- | --- |
+| hunt_hint | 157 | 683 | 5,643 | 0% | 89% | 350 |
+| sense_reason | 44 | 3,861 | 6,064 | 0% | n/a (not cached) | 343 |
+| found_epilogue | 33 | 3,472 | 6,185 | 0% | n/a | 301 |
+| clue_options | 44 | 5,512 | 8,778 | 0% | 9% | 593 |
+| quest_plan | 6 | 9,696 | 14,610 | 0% | 0% | 4,134 |
+| business_brief | 12 | 12,922 | 17,219 | 0% | 0% | 1,405 |
+| found_card | 7 | 11,880 | 13,257 | 0% | n/a | n/a (image) |
+
+Quest plans are the slowest and most expensive call. After trimming (short candidate ids, a shorter prompt, one parallel tool step, at most 5 rounds) the quest p50 went from 13.7 s to 9.7 s and tokens from about 7,700 to about 4,100 per plan; this is still above our 9 s target. The quest and brief rows above are from the post-fix run (eval plus emulator traffic; the earlier row was 10 calls, p50 13.7 s, p95 28.4 s, 37.5% brief fallback). The Quest card now shows progress steps while it waits. See `docs/eval-results.md` for the 26-scenario quality and safety evaluation (26/26 passed, 0 fallbacks when run sequentially).
