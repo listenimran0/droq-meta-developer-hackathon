@@ -1,6 +1,13 @@
 {
   "name": "droq",
   "version": "1.2.3",
+  "description": "DROQ: leave hidden Drops at real places; others open them only by walking there. Meta Muse powers the quest agent, hints, writing help, share cards and business insights.",
+  "license": "MIT",
+  "author": "Imran",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/listenimran0/droq-meta-developer-hackathon.git"
+  },
   "main": "index.js",
   "scripts": {
     "start": "expo start",
