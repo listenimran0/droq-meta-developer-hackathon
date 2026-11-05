@@ -9,9 +9,9 @@
 
 ## Why it matters
 
-**The human side.** Places hold moments that vanish: a conversation on a bench, a note someone wanted a stranger to find, the corner where something started. DROQ lets you leave that moment where it happened and lets someone else receive it. There is no feed and no follower count. A Drop opens only when the server verifies that you are standing there, so the interesting part is the walk, not the screen.
+**The human side.** Places hold moments that vanish: a conversation on a bench, a note someone wanted a stranger to find, the corner where something started. DROQ lets you leave that moment where it happened and lets someone else receive it. There is no public feed of strangers' posts and no followers: connections are mutual friends (request and accept), and a Drop can be public or friends-only. The app does have a "Days outside" leaderboard and reactions on Drops you open. A Drop opens only when the server verifies that you are standing there, so the interesting part is the walk, not the screen.
 
-**The business side.** A café, a bookshop or a street-food stall can leave a Business drop. What they get back is *verified* footfall: people who physically showed up, counted on the server, not clicks and not reviews that anyone can fake. The business sees aggregates only (counts, peak hour, weekday split, new vs returning, a suggested → opened → verified funnel) and a Muse-written brief. Visitors stay anonymous. The business model is paid placement: a verified Business drop may appear as the single, clearly labelled *Sponsored* stop in a walker's AI Quest.
+**The business side.** A café, a bookshop or a street-food stall can leave a Business drop. What they get back is *verified* footfall: people who physically showed up, counted on the server, not clicks or reviews. The business sees aggregates only (counts, peak hour, weekday split, new vs returning, a suggested → opened → verified funnel) and a Muse-written brief. Visitors stay anonymous. The business model is paid placement: a verified Business drop may appear as the single, clearly labelled *Sponsored* stop in a walker's AI Quest.
 
 ## Meta products used
 
