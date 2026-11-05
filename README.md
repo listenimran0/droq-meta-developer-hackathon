@@ -5,7 +5,8 @@
 - **Hackathon:** Meta Global AI Developer Hackathon
 - **Track:** Startup
 - **Theme:** Build for Your World
-- **Demo video:** (link coming)
+
+**Demo video (3 min): [https://youtu.be/ahecbjdcXBw](https://youtu.be/ahecbjdcXBw)**
 
 ## Why it matters
 
@@ -108,7 +109,7 @@ Production readiness, with measurements:
 
 ## How to evaluate in 5 minutes
 
-1. **Watch the demo video** (link coming).
+1. **Watch the demo video** (3 min): [https://youtu.be/ahecbjdcXBw](https://youtu.be/ahecbjdcXBw).
 2. **Read the evidence:** [docs/eval-results.md](docs/eval-results.md) (26/26 scenarios passed, 0 fallbacks in the last run) and the [telemetry table](docs/how-it-works.md#production-telemetry).
 3. **Run the unit tests** (verified in this repository: 12 suites, 121 tests pass; `tsc` is clean):
    ```bash
@@ -140,7 +141,7 @@ Production readiness, with measurements:
 | **Impact** | Why it matters above; the Business layer (Verified visits, audience, sponsored funnel) in [docs/how-it-works.md](docs/how-it-works.md); owner screens in the gallery. |
 | **Use of Meta AI tooling** | The table above: Muse Spark with tool calling (Quest Agent) and Muse Image (Found Card) through the Meta Model API; [`supabase/functions/ai-narrator/index.ts`](supabase/functions/ai-narrator/index.ts). |
 | **Technical depth** | Server-verified unlock, DB-backed rate limits and circuit breaker, single-flight cache, server-side validation of model output, deterministic fallbacks: [Scaling and resilience](docs/how-it-works.md#scaling-and-resilience), [eval results](docs/eval-results.md), `__tests__/`, `supabase/migrations/030`-`034`. |
-| **Demo** | Demo video (link coming) and the screenshots above. |
+| **Demo** | [Demo video](https://youtu.be/ahecbjdcXBw) and the screenshots above. |
 
 ## Honest limitations and roadmap
 
